@@ -12,7 +12,10 @@
 #include "nvdscustomlib_base.hpp"
 
 // CUDA kernel function declaration
-extern "C" int cuda_process_frame(int gpu_id, void* y_ptr, uint16_t width, uint16_t height, uint16_t pitch);
+extern "C" int cuda_process_frame(void* y_ptr, uint16_t width, uint16_t height, uint16_t pitch);
+extern "C" int cuda_compute_sharpness(void* y_ptr, void* s_ptr, uint16_t width, uint16_t height, uint16_t pitch);
+
+
 
 class MyCudaProcessor : public IDSCustomLibrary {
 private:
@@ -24,42 +27,20 @@ private:
     NvBufSurface* temp_surface;
     bool temp_surface_initialized;
 
-    bool initTempSurface(int width, int height) {
-        cleanup();
-
-        NvBufSurfaceCreateParams create_params = {0};
-        create_params.gpuId = gpu_id;
-        create_params.width = width;
-        create_params.height = height;
-        create_params.colorFormat = NVBUF_COLOR_FORMAT_NV12;
-        create_params.layout = NVBUF_LAYOUT_PITCH;
-        create_params.memType = NVBUF_MEM_DEFAULT;
-
-        int ret = NvBufSurfaceCreate(&temp_surface, 1, &create_params);
-        if (ret != 0) {
-            GST_ERROR("Failed to create temp surface: %d", ret);
-            return false;
-        }
-
-        transform_config_params.compute_mode = NvBufSurfTransformCompute_Default;
-        NvBufSurfTransformSetSessionParams(&transform_config_params);
-
-        temp_surface_initialized = true;
-        return true;
-    }
-
-    void cleanup() {
-        if (temp_surface_initialized) {
-            NvBufSurfaceDestroy(temp_surface);
-            temp_surface_initialized = false;
-        }
-    }
+    unsigned char* unified_sharpness_buffer;
+    
+    
 
 public:
     MyCudaProcessor() : cuda_stream(nullptr), gpu_id(0), temp_surface(nullptr), temp_surface_initialized(false) {}
 
     ~MyCudaProcessor() override {
-        cleanup();
+        if (temp_surface_initialized) {
+            NvBufSurfaceDestroy(temp_surface);
+            temp_surface_initialized = false;
+        
+            cudaFree(unified_sharpness_buffer);
+        }
     }
 
     bool SetInitParams(DSCustom_CreateParams *params) override {
@@ -87,9 +68,9 @@ public:
     
         if (!temp_surface_initialized || 
             temp_surface->surfaceList[0].width != src_params->width ||
-            temp_surface->surfaceList[0].height != src_params->height) {
-            cleanup();
-    
+            temp_surface->surfaceList[0].height != src_params->height) 
+        {
+            
             NvBufSurfaceCreateParams create_params = {0};
             create_params.gpuId = gpu_id;
             create_params.width = src_params->width;
@@ -103,6 +84,14 @@ public:
                 gst_buffer_unmap(inbuf, &in_map_info);
                 return BufferResult::Buffer_Error;
             }
+
+
+            cudaMallocManaged(&unified_sharpness_buffer, 3840*2160);
+            printf("\n\n\nunified dharpness buffer %p\n", unified_sharpness_buffer);
+
+
+
+
             temp_surface_initialized = true;
         }
     
@@ -142,8 +131,27 @@ public:
         unsigned char* y_plane_dev;
         cudaHostGetDevicePointer(&y_plane_dev, temp_surface->surfaceList[0].mappedAddr.addr[0], 0);
     
-        cuda_process_frame(gpu_id,
-                           y_plane_dev,
+
+        
+        cuda_compute_sharpness(y_plane_dev, unified_sharpness_buffer,
+            src_params->width,
+            src_params->height,
+            temp_surface->surfaceList[0].planeParams.pitch[0]);
+        cudaStreamSynchronize(cuda_stream);
+        
+        uint64_t acc = 0; 
+        for(int x = 0; x < 3840; x++)
+        {
+            for(int y = 0; y < 2160; y++)
+            {
+                acc += unified_sharpness_buffer[x+y*3840];
+            }    
+        }
+        printf("Sharpness is %f\n", acc / (3840.0*2160));
+        cudaStreamSynchronize(cuda_stream);
+
+
+        cuda_process_frame(y_plane_dev,
                            src_params->width,
                            src_params->height,
                            temp_surface->surfaceList[0].planeParams.pitch[0]);

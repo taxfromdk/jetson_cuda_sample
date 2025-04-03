@@ -14,56 +14,100 @@
     } \
   } while(0)
 
+    __device__ unsigned char diff(unsigned char a, unsigned char b)
+    {
+        if (a > b)
+        {
+            return a - b;
+        }
+        return b-a;
+    }
 
-#define BLOCK_LINEAR_WIDTH 64
-#define BLOCK_LINEAR_HEIGHT 16
+    __global__ void compute_sharpness(unsigned char* y_plane, unsigned char* s_plane, int width, int height, int pitch)
+    {
+        int x = blockIdx.x * blockDim.x + threadIdx.x;
+        int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-__device__ size_t block_linear_offset(size_t x, size_t y, size_t pitch)
-{
-    size_t block_x = x / BLOCK_LINEAR_WIDTH;
-    size_t block_y = y / BLOCK_LINEAR_HEIGHT;
+        if ((x < width) && (y < height)) 
+        {
+            uint32_t ix = x + y*pitch;
+            if( x > 0)
+            {
+                s_plane[ix] = diff(y_plane[ix - 1],  y_plane[ix]);
+            }
+            else
+            {
+                s_plane[ix] = diff(y_plane[ix + 1],  y_plane[ix]);
+            }
+        }
+    }
+  
+  int cuda_compute_sharpness(void* y_ptr, void* s_ptr, uint16_t width, uint16_t height, uint16_t pitch)
+  {
+      cudaError_t err; 
+      if (y_ptr == NULL) {
+          fprintf(stderr, "Error: Null CUDA pointer A\n");
+          return 0;
+      }
+      if (s_ptr == NULL) {
+          fprintf(stderr, "Error: Null CUDA pointer B\n");
+          return 0;
+      }
+      
+      dim3 block(16,16);
+      const dim3 grid(
+          (width + block.x - 1) / block.x,
+          (height + block.y - 1) / block.y
+      );
+      compute_sharpness<<<grid, block>>>((unsigned char* )y_ptr, (unsigned char*)s_ptr, width, height, pitch);
+      err = cudaGetLastError();
+      if (err != cudaSuccess) {
+          fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+          return 0;
+      }
+      
+      CUDA_CHECK(cudaDeviceSynchronize());
+      //printf("Kernel completed successfully\n");
+      return 1;
+  }
 
-    size_t inner_x = x % BLOCK_LINEAR_WIDTH;
-    size_t inner_y = y % BLOCK_LINEAR_HEIGHT;
 
-    size_t block_offset = (block_y * (pitch / BLOCK_LINEAR_WIDTH) + block_x) * (BLOCK_LINEAR_WIDTH * BLOCK_LINEAR_HEIGHT);
-    size_t pixel_offset = inner_y * BLOCK_LINEAR_WIDTH + inner_x;
 
-    return block_offset + pixel_offset;
-}
-
-__global__ void draw_square_kernel(unsigned char* y_plane, int width, int height, int pitch)
+__global__ void draw_kernel(unsigned char* y_plane, int width, int height, int pitch)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     
     if ((x < width) && (y < height)) 
     {
-        if(y > 800)
+        int m_x = 1920;
+        int m_y = 1080;
+        int dx = m_x - x;
+        int dy = m_y - y;
+        int r = dx*dx + dy*dy;
+        int inner = 300;
+        int outer = 310;
+        if( r > inner*inner and r < outer*outer)
         {
-            unsigned char* pixel = y_plane + block_linear_offset(x,y,pitch);
-            *pixel = 255;
+            y_plane[ x + y*pitch] = 255;
         }
     }
 }
 
-int cuda_process_frame(int gpuId, void* y_ptr, uint16_t width, uint16_t height, uint16_t pitch)
+int cuda_process_frame(void* y_ptr, uint16_t width, uint16_t height, uint16_t pitch)
 {
     cudaError_t err; 
-    printf("cuda_process_frame started\n");
-    
     if (y_ptr == NULL) {
         fprintf(stderr, "Error: Null CUDA pointer\n");
         return 0;
     }
     
-    // Set CUDA device
-    //CUDA_CHECK(cudaSetDevice(gpuId));
-    
-    dim3 block(8,8);
-    dim3 grid(480, 270);
-    draw_square_kernel<<<grid, block>>>((unsigned char* )y_ptr, width, height, pitch);
-    printf("What a day\n");
+    dim3 block(16,16);
+    const dim3 grid(
+        (width + block.x - 1) / block.x,
+        (height + block.y - 1) / block.y
+    );
+    draw_kernel<<<grid, block>>>((unsigned char* )y_ptr, width, height, pitch);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(err));
@@ -71,7 +115,8 @@ int cuda_process_frame(int gpuId, void* y_ptr, uint16_t width, uint16_t height, 
     }
     
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    printf("Empty kernel completed successfully\n");
+    //printf("Kernel completed successfully\n");
     return 1;
 }
+
+

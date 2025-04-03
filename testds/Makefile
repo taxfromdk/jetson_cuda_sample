@@ -31,6 +31,7 @@ GST_CFLAGS += -I/usr/include/gstreamer-1.0/gst/base
 test: libmycudaproc.so
 	GST_DEBUG=1,nvdsvideotemplate:5 GST_DEBUG=LD_LIBRARY_PATH=$(DEEPSTREAM_PATH)/lib:$$LD_LIBRARY_PATH gst-launch-1.0 nvarguscamerasrc sensor-id=1 ! \
 		"video/x-raw(memory:NVMM),format=NV12,width=3840,height=2160,framerate=30/1" ! \
+		nvvidconv bl-output=false ! \
 		nvdsvideotemplate customlib-name=./libmycudaproc.so ! \
 		nvv4l2h265enc iframeinterval=90 maxperf-enable=true insert-sps-pps=true preset-level=1 insert-vui=true insert-aud=true bitrate=8000000 ! \
 		h265parse config-interval=-1 ! \

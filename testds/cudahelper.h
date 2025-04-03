@@ -7,7 +7,8 @@
  extern "C" {
  #endif
  
- int cuda_process_frame(int gpuId, void* y_plane, uint16_t width, uint16_t height, uint16_t pitch);
+int cuda_compute_sharpness(void* y_ptr, void* s_ptr, uint16_t width, uint16_t height, uint16_t pitch);
+int cuda_process_frame(void* y_plane, uint16_t width, uint16_t height, uint16_t pitch);
  
  #ifdef __cplusplus
  }
