@@ -73,7 +73,7 @@
 
 
 
-__global__ void draw_kernel(unsigned char* y_plane, int width, int height, int pitch)
+__global__ void draw_kernel(unsigned char* y_plane, int width, int height, int pitch, float timestamp_sec)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -85,8 +85,8 @@ __global__ void draw_kernel(unsigned char* y_plane, int width, int height, int p
         int dx = m_x - x;
         int dy = m_y - y;
         int r = dx*dx + dy*dy;
-        int inner = 300;
-        int outer = 310;
+        int inner = 300 + sin(timestamp_sec)*300;
+        int outer = inner+10;
         if( r > inner*inner and r < outer*outer)
         {
             y_plane[ x + y*pitch] = 255;
@@ -94,7 +94,7 @@ __global__ void draw_kernel(unsigned char* y_plane, int width, int height, int p
     }
 }
 
-int cuda_process_frame(void* y_ptr, uint16_t width, uint16_t height, uint16_t pitch)
+int cuda_process_frame(void* y_ptr, uint16_t width, uint16_t height, uint16_t pitch, float timestamp_sec)
 {
     cudaError_t err; 
     if (y_ptr == NULL) {
@@ -107,7 +107,7 @@ int cuda_process_frame(void* y_ptr, uint16_t width, uint16_t height, uint16_t pi
         (width + block.x - 1) / block.x,
         (height + block.y - 1) / block.y
     );
-    draw_kernel<<<grid, block>>>((unsigned char* )y_ptr, width, height, pitch);
+    draw_kernel<<<grid, block>>>((unsigned char* )y_ptr, width, height, pitch, timestamp_sec);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(err));

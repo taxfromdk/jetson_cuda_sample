@@ -32,21 +32,9 @@
    /* Video format info */
    GstVideoInfo video_info;
    
-
-
+   void* unified_sharpness_buffer;
    cudaStream_t cuda_stream;
    
-   NvBufSurfTransformConfigParams transform_config_params;
-   NvBufSurfTransformParams transform_params;
-   NvBufSurface* temp_surface;
-   bool temp_surface_initialized;
-
-   void* unified_sharpness_buffer;
-   
-
-
-
-
    /* Frame counter */
    gulong frame_num;
  };

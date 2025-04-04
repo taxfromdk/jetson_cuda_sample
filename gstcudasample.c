@@ -123,11 +123,16 @@ gst_cuda_sample_finalize (GObject * object)
     printf("Deallocating\n");
     GstCudaSample *overlay = GST_CUDA_SAMPLE (object);
 
-    if (overlay->temp_surface_initialized) 
+    if (overlay->unified_sharpness_buffer) 
     {
-        NvBufSurfaceDestroy(overlay->temp_surface);
+    
         cudaFree(overlay->unified_sharpness_buffer);
-        overlay->temp_surface_initialized = false;
+        overlay->unified_sharpness_buffer = NULL;
+
+        cudaStreamSynchronize(overlay->cuda_stream);  // Make sure all operations are complete
+        cudaStreamDestroy(overlay->cuda_stream);
+        overlay->cuda_stream = NULL;
+    
     }
     G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -226,8 +231,7 @@ gst_cuda_sample_finalize (GObject * object)
    return TRUE;
  }
  
- static gboolean
- gst_cuda_sample_start (GstBaseTransform * base)
+ static gboolean gst_cuda_sample_start (GstBaseTransform * base)
  {
    GstCudaSample *overlay = GST_cuda_sample (base);
  
@@ -250,90 +254,7 @@ gst_cuda_sample_finalize (GObject * object)
 
 void handleSurface(GstCudaSample *filter, NvBufSurface *surface)
 {
-    NvBufSurfaceParams* src_params = &surface->surfaceList[0];
-    if (!filter->temp_surface_initialized) 
-    {
-
-        NvBufSurfaceCreateParams create_params = {0};
-        create_params.gpuId = filter->gpu_id;
-        create_params.width = src_params->width;
-        create_params.height = src_params->height;
-        create_params.colorFormat = NVBUF_COLOR_FORMAT_NV12;
-        create_params.layout = NVBUF_LAYOUT_PITCH;
-        create_params.memType = NVBUF_MEM_DEFAULT; // CPU accessible
-
-        if (NvBufSurfaceCreate(&filter->temp_surface, 1, &create_params) != 0) 
-        {
-            GST_ERROR("Failed to create temp surface");
-            return;
-        }
-        cudaMallocManaged(&filter->unified_sharpness_buffer, src_params->width*src_params->height, cudaMemAttachGlobal);
-        printf("\n\n\nunified dharpness buffer %p\n", filter->unified_sharpness_buffer);
-        filter->temp_surface_initialized = true;
-    }
-
-
-    // Map NVMM buffer to CPU
-    // Corrected buffer mappings
-    if (NvBufSurfaceMap(surface, -1, -1, NVBUF_MAP_READ_WRITE) != 0 || NvBufSurfaceMap(filter->temp_surface, -1, -1, NVBUF_MAP_READ_WRITE) != 0) 
-    {
-        GST_ERROR("Surface mapping failed");
-        return;
-    }
-
-    NvBufSurfaceSyncForCpu(surface, -1, -1);
-    NvBufSurfaceSyncForCpu(filter->temp_surface, -1, -1);
-
-
-    // Copy NVMM->CPU buffer
-    cudaMemcpy2DAsync(
-        filter->temp_surface->surfaceList[0].mappedAddr.addr[0],
-        filter->temp_surface->surfaceList[0].planeParams.pitch[0],
-        surface->surfaceList[0].mappedAddr.addr[0],
-        surface->surfaceList[0].planeParams.pitch[0],
-        src_params->width,
-        src_params->height,
-        cudaMemcpyHostToHost,
-        filter->cuda_stream
-    );
-
-    // Ensure copy is done
-    cudaStreamSynchronize(0);
-
-    // Now run your CUDA kernel (temp_surface must be mapped with cudaHostRegister for CUDA kernel directly)
-    cudaHostRegister(filter->temp_surface->surfaceList[0].mappedAddr.addr[0],
-                        src_params->height * filter->temp_surface->surfaceList[0].planeParams.pitch[0],
-                        cudaHostRegisterMapped);
-
-    unsigned char* y_plane_dev;
-    cudaHostGetDevicePointer(&y_plane_dev, filter->temp_surface->surfaceList[0].mappedAddr.addr[0], 0);
-
-    cuda_process_frame(y_plane_dev,
-        src_params->width,
-        src_params->height,
-        filter->temp_surface->surfaceList[0].planeParams.pitch[0]);
-
-    cudaStreamSynchronize(0);
-    cudaHostUnregister(filter->temp_surface->surfaceList[0].mappedAddr.addr[0]);
-
-
-    // Copy CPU buffer back to NVMM buffer
-    cudaMemcpy2DAsync(
-        surface->surfaceList[0].mappedAddr.addr[0],
-        surface->surfaceList[0].planeParams.pitch[0],
-        filter->temp_surface->surfaceList[0].mappedAddr.addr[0],
-        filter->temp_surface->surfaceList[0].planeParams.pitch[0],
-        src_params->width,
-        src_params->height,
-        cudaMemcpyHostToHost,
-        NULL
-    );
-
-    cudaStreamSynchronize(0);
-
-    NvBufSurfaceSyncForDevice(surface, -1, -1);
-    NvBufSurfaceUnMap(filter->temp_surface, -1, -1);
-    
+   
 }
 
 
@@ -344,10 +265,32 @@ void handleSurface(GstCudaSample *filter, NvBufSurface *surface)
     GstFlowReturn ret = GST_FLOW_OK;
     GstMapInfo in_map_info;
     NvBufSurface *surface = NULL;
+    GstClockTime timestamp;
+    gfloat timestamp_sec = 0;
+
 
     filter->frame_num++;
 
     GST_DEBUG_OBJECT(filter, "Processing Frame %lu", filter->frame_num);
+
+
+
+    
+    // Get buffer timestamp
+    timestamp = GST_BUFFER_TIMESTAMP(buf);
+
+    if (GST_CLOCK_TIME_IS_VALID(timestamp)) 
+    {
+        // Convert to seconds
+        timestamp_sec = (gfloat)timestamp / GST_SECOND;
+        GST_DEBUG_OBJECT(filter, "Buffer timestamp: %f seconds", timestamp_sec);
+    }
+    else 
+    {
+        GST_DEBUG_OBJECT(filter, "Buffer has invalid timestamp");
+    }
+
+
 
     /* Skip processing if not enabled */
     if (!filter->process_enabled) {
@@ -370,20 +313,61 @@ void handleSurface(GstCudaSample *filter, NvBufSurface *surface)
 
     // Get the NvBufSurface from the mapped buffer
     surface = (NvBufSurface *)in_map_info.data;
-    if (!surface) {
+    if (surface) 
+    {
+        NvBufSurfaceParams* src_params = &surface->surfaceList[0];
+        if (!filter->unified_sharpness_buffer) 
+        {
+    
+            cudaMallocManaged(&filter->unified_sharpness_buffer, src_params->width*src_params->height, cudaMemAttachGlobal);
+            printf("\n\n\nunified dharpness buffer %p\n", filter->unified_sharpness_buffer);
+    
+            cudaError_t cuda_err;
+            // Set the GPU device to use
+            cuda_err = cudaSetDevice(filter->gpu_id);
+            if (cuda_err != cudaSuccess) 
+            {
+                GST_ERROR_OBJECT (filter, "Failed to set CUDA device %d: %s", filter->gpu_id, cudaGetErrorString(cuda_err));
+                return;
+            }
+    
+            // Create CUDA stream
+            cuda_err = cudaStreamCreate(&filter->cuda_stream);
+            if (cuda_err != cudaSuccess) 
+            {
+                GST_ERROR_OBJECT (filter, "Failed to create CUDA stream: %s", cudaGetErrorString(cuda_err));
+                return;
+            }
+        }
+    
+        if (NvBufSurfaceMap(surface, -1, -1, NVBUF_MAP_READ_WRITE) == 0)
+        {
+            //NvBufSurfaceSyncForCpu(surface, -1, -1);
+            cudaHostRegister(surface->surfaceList[0].mappedAddr.addr[0], src_params->height * surface->surfaceList[0].planeParams.pitch[0], cudaHostRegisterMapped);
+            unsigned char* y_plane_dev;
+            cudaHostGetDevicePointer(&y_plane_dev, surface->surfaceList[0].mappedAddr.addr[0], 0);
+            cuda_process_frame(y_plane_dev, src_params->width, src_params->height, surface->surfaceList[0].planeParams.pitch[0], timestamp_sec);
+            cudaStreamSynchronize(filter->cuda_stream);    
+            cudaHostUnregister(surface->surfaceList[0].mappedAddr.addr[0]);
+            //NvBufSurfaceSyncForDevice(surface, -1, -1);
+
+            // Unmap the surface
+            NvBufSurfaceUnMap(surface, -1, -1);
+        } 
+        else
+        {
+            GST_ERROR("Surface mapping failed");
+            return;
+        }
+    
+        
+    }
+    else
+    {
         GST_ERROR_OBJECT(filter, "Failed to get NvBufSurface from mapped buffer");
-        gst_buffer_unmap(buf, &in_map_info);
-        return GST_FLOW_ERROR;
     }
 
-    handleSurface(filter, surface);
-
-    // Unmap the surface
-    NvBufSurfaceUnMap(surface, -1, -1);
-
-    // Unmap the buffer
     gst_buffer_unmap(buf, &in_map_info);
-
     return ret;
 }
  

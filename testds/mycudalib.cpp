@@ -24,23 +24,15 @@ private:
 
     NvBufSurfTransformConfigParams transform_config_params;
     NvBufSurfTransformParams transform_params;
-    NvBufSurface* temp_surface;
-    bool temp_surface_initialized;
-
     unsigned char* unified_sharpness_buffer;
     
     
 
 public:
-    MyCudaProcessor() : cuda_stream(nullptr), gpu_id(0), temp_surface(nullptr), temp_surface_initialized(false) {}
+    MyCudaProcessor() : cuda_stream(nullptr), gpu_id(0), unified_sharpness_buffer(nullptr) {}
 
     ~MyCudaProcessor() override {
-        if (temp_surface_initialized) {
-            NvBufSurfaceDestroy(temp_surface);
-            temp_surface_initialized = false;
-        
-            cudaFree(unified_sharpness_buffer);
-        }
+        cudaFree(unified_sharpness_buffer);
     }
 
     bool SetInitParams(DSCustom_CreateParams *params) override {
@@ -66,38 +58,15 @@ public:
     
         NvBufSurfaceParams* src_params = &surface->surfaceList[0];
     
-        if (!temp_surface_initialized || 
-            temp_surface->surfaceList[0].width != src_params->width ||
-            temp_surface->surfaceList[0].height != src_params->height) 
+        if( !unified_sharpness_buffer)
         {
-            
-            NvBufSurfaceCreateParams create_params = {0};
-            create_params.gpuId = gpu_id;
-            create_params.width = src_params->width;
-            create_params.height = src_params->height;
-            create_params.colorFormat = NVBUF_COLOR_FORMAT_NV12;
-            create_params.layout = NVBUF_LAYOUT_PITCH;
-            create_params.memType = NVBUF_MEM_DEFAULT; // CPU accessible
-    
-            if (NvBufSurfaceCreate(&temp_surface, 1, &create_params) != 0) {
-                GST_ERROR("Failed to create temp surface");
-                gst_buffer_unmap(inbuf, &in_map_info);
-                return BufferResult::Buffer_Error;
-            }
-
-
             cudaMallocManaged(&unified_sharpness_buffer, 3840*2160);
             printf("\n\n\nunified dharpness buffer %p\n", unified_sharpness_buffer);
-
-
-
-
-            temp_surface_initialized = true;
         }
-    
+        
         // Map NVMM buffer to CPU
         // Corrected buffer mappings
-        if (NvBufSurfaceMap(surface, -1, -1, NVBUF_MAP_READ_WRITE) != 0 || NvBufSurfaceMap(temp_surface, -1, -1, NVBUF_MAP_READ_WRITE) != 0) 
+        if (NvBufSurfaceMap(surface, -1, -1, NVBUF_MAP_READ_WRITE) != 0) 
         {
             GST_ERROR("Surface mapping failed");
             gst_buffer_unmap(inbuf, &in_map_info);
@@ -105,38 +74,16 @@ public:
         }
 
         NvBufSurfaceSyncForCpu(surface, -1, -1);
-        NvBufSurfaceSyncForCpu(temp_surface, -1, -1);
-
-    
-        // Copy NVMM->CPU buffer
-        cudaMemcpy2DAsync(
-            temp_surface->surfaceList[0].mappedAddr.addr[0],
-            temp_surface->surfaceList[0].planeParams.pitch[0],
-            surface->surfaceList[0].mappedAddr.addr[0],
-            surface->surfaceList[0].planeParams.pitch[0],
-            src_params->width,
-            src_params->height,
-            cudaMemcpyHostToHost,
-            cuda_stream
-        );
-    
-        // Ensure copy is done
-        cudaStreamSynchronize(cuda_stream);
-    
-        // Now run your CUDA kernel (temp_surface must be mapped with cudaHostRegister for CUDA kernel directly)
-        cudaHostRegister(temp_surface->surfaceList[0].mappedAddr.addr[0],
-                         src_params->height * temp_surface->surfaceList[0].planeParams.pitch[0],
-                         cudaHostRegisterMapped);
-    
+        cudaHostRegister(surface->surfaceList[0].mappedAddr.addr[0],
+                         src_params->height * src_params->planeParams.pitch[0],
+                         cudaHostRegisterMapped);    
         unsigned char* y_plane_dev;
-        cudaHostGetDevicePointer(&y_plane_dev, temp_surface->surfaceList[0].mappedAddr.addr[0], 0);
+        cudaHostGetDevicePointer(&y_plane_dev, surface->surfaceList[0].mappedAddr.addr[0], 0);
     
-
-        
-        cuda_compute_sharpness(y_plane_dev, unified_sharpness_buffer,
-            src_params->width,
-            src_params->height,
-            temp_surface->surfaceList[0].planeParams.pitch[0]);
+        //************************************************
+        //*   Sharpness
+        //************************************************
+        cuda_compute_sharpness(y_plane_dev, unified_sharpness_buffer, src_params->width, src_params->height, src_params->planeParams.pitch[0]);
         cudaStreamSynchronize(cuda_stream);
         
         uint64_t acc = 0; 
@@ -150,32 +97,16 @@ public:
         printf("Sharpness is %f\n", acc / (3840.0*2160));
         cudaStreamSynchronize(cuda_stream);
 
-
-        cuda_process_frame(y_plane_dev,
-                           src_params->width,
-                           src_params->height,
-                           temp_surface->surfaceList[0].planeParams.pitch[0]);
+        //************************************************
+        //*   Draw
+        //************************************************
+        cuda_process_frame(y_plane_dev, src_params->width, src_params->height, src_params->planeParams.pitch[0]);
     
         cudaStreamSynchronize(cuda_stream);
-        cudaHostUnregister(temp_surface->surfaceList[0].mappedAddr.addr[0]);
-    
-        // Copy CPU buffer back to NVMM buffer
-        cudaMemcpy2DAsync(
-            surface->surfaceList[0].mappedAddr.addr[0],
-            surface->surfaceList[0].planeParams.pitch[0],
-            temp_surface->surfaceList[0].mappedAddr.addr[0],
-            temp_surface->surfaceList[0].planeParams.pitch[0],
-            src_params->width,
-            src_params->height,
-            cudaMemcpyHostToHost,
-            cuda_stream
-        );
-    
-        cudaStreamSynchronize(cuda_stream);
+        cudaHostUnregister(surface->surfaceList[0].mappedAddr.addr[0]);
     
         NvBufSurfaceSyncForDevice(surface, -1, -1);
         NvBufSurfaceUnMap(surface, -1, -1);
-        NvBufSurfaceUnMap(temp_surface, -1, -1);
         gst_buffer_unmap(inbuf, &in_map_info);
     
         return BufferResult::Buffer_Ok;
