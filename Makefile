@@ -59,6 +59,7 @@ test: $(TARGET)
 	gst-launch-1.0 \
 		nvarguscamerasrc sensor-id=1 \
 		! "video/x-raw(memory:NVMM),format=NV12,width=3840,height=2160,framerate=30/1" \
+		! nvvidconv bl-output=false \
 		! cudasample \
 		! nvv4l2h265enc iframeinterval=90 maxperf-enable=true insert-sps-pps=true preset-level=1 insert-vui=true insert-aud=true bitrate=8000000 \
 		! h265parse config-interval=-1 \

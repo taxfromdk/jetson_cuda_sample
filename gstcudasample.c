@@ -9,6 +9,7 @@
  #include "cudahelper.h"
  #include "gstcudasample.h"
  
+  
  /* Add missing NVIDIA headers */
  #include <nvbufsurface.h>  /* For NvBufSurface related functions and types */
  
@@ -61,20 +62,15 @@
  G_DEFINE_TYPE (GstCudaSample, gst_cuda_sample, GST_TYPE_BASE_TRANSFORM);
  
  /* Function prototypes */
- static void gst_cuda_sample_set_property (GObject * object, guint prop_id,
-     const GValue * value, GParamSpec * pspec);
- static void gst_cuda_sample_get_property (GObject * object, guint prop_id,
-     GValue * value, GParamSpec * pspec);
- static GstFlowReturn gst_cuda_sample_transform_ip (GstBaseTransform * base,
-     GstBuffer * buf);
- static gboolean gst_cuda_sample_set_caps (GstBaseTransform * base,
-     GstCaps * incaps, GstCaps * outcaps);
+ static void gst_cuda_sample_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec);
+ static void gst_cuda_sample_get_property (GObject * object, guint prop_id, GValue * value, GParamSpec * pspec);
+ static GstFlowReturn gst_cuda_sample_transform_ip (GstBaseTransform * base, GstBuffer * buf);
+ static gboolean gst_cuda_sample_set_caps (GstBaseTransform * base, GstCaps * incaps, GstCaps * outcaps);
  static gboolean gst_cuda_sample_start (GstBaseTransform * base);
  static gboolean gst_cuda_sample_stop (GstBaseTransform * base);
  
  /* Initialize the cuda_sample's class */
- static void
- gst_cuda_sample_class_init (GstCudaSampleClass * klass)
+ static void gst_cuda_sample_class_init (GstCudaSampleClass * klass)
  {
    GObjectClass *gobject_class = (GObjectClass *) klass;
    GstElementClass *gstelement_class = (GstElementClass *) klass;
@@ -113,13 +109,30 @@
  }
  
  /* Initialize the new element */
- static void
- gst_cuda_sample_init (GstCudaSample * overlay)
- {
-   overlay->process_enabled = TRUE;
-   overlay->gpu_id = 0;
-   overlay->frame_num = 0;  /* Initialize frame counter */
- }
+static void gst_cuda_sample_init (GstCudaSample * overlay)
+{
+    printf("Initializing variables\n");
+    overlay->process_enabled = TRUE;
+    overlay->gpu_id = 0;
+    overlay->frame_num = 0;  /* Initialize frame counter */
+}
+
+static void
+gst_cuda_sample_finalize (GObject * object)
+{
+    printf("Deallocating\n");
+    GstCudaSample *overlay = GST_CUDA_SAMPLE (object);
+
+    if (overlay->temp_surface_initialized) 
+    {
+        NvBufSurfaceDestroy(overlay->temp_surface);
+        cudaFree(overlay->unified_sharpness_buffer);
+        overlay->temp_surface_initialized = false;
+    }
+    G_OBJECT_CLASS (parent_class)->finalize (object);
+}
+
+
  
  static void
  gst_cuda_sample_set_property (GObject * object, guint prop_id,
@@ -219,7 +232,7 @@
    GstCudaSample *overlay = GST_cuda_sample (base);
  
    GST_DEBUG_OBJECT (overlay, "Start");
-   overlay->frame_num = 0;  /* Reset frame counter on start */
+   
  
    return TRUE;
  }
@@ -234,151 +247,145 @@
    return TRUE;
  }
  
- static GstFlowReturn 
- gst_cuda_sample_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
- {
-     GstCudaSample *filter = GST_cuda_sample (trans);
-     GstFlowReturn ret = GST_FLOW_OK;
-     GstMapInfo in_map_info;
-     NvBufSurface *surface = NULL;
- 
-     filter->frame_num++;
- 
-     GST_DEBUG_OBJECT(filter, "Processing Frame %lu", filter->frame_num);
- 
-     /* Skip processing if not enabled */
-     if (!filter->process_enabled) {
-         GST_DEBUG_OBJECT(filter, "Processing disabled, skipping frame");
-         return GST_FLOW_OK;
-     }
- 
-     // Validate buffer
-     if (!buf || gst_buffer_get_size(buf) == 0) {
-         GST_WARNING_OBJECT(filter, "Empty buffer received, skipping");
-         return GST_FLOW_OK;
-     }
- 
-     // Map the buffer for read/write access
-     memset(&in_map_info, 0, sizeof(in_map_info));
-     if (!gst_buffer_map(buf, &in_map_info, GST_MAP_READ | GST_MAP_WRITE)) {
-         GST_ERROR_OBJECT(filter, "Failed to map gst buffer");
-         return GST_FLOW_ERROR;
-     }
-     
-     if(1)
-     {
-      // Get the NvBufSurface from the mapped buffer
-      surface = (NvBufSurface *)in_map_info.data;
-      if (!surface) {
-          GST_ERROR_OBJECT(filter, "Failed to get NvBufSurface from mapped buffer");
-          gst_buffer_unmap(buf, &in_map_info);
-          return GST_FLOW_ERROR;
-      }
-  
-      // Debug info about the surface
-      GST_DEBUG_OBJECT(filter, "Surface: gpuId=%d, batchSize=%d, numFilled=%d, isContiguous=%d, memType=%d",
-                      surface->gpuId, surface->batchSize, surface->numFilled, surface->isContiguous, surface->memType);
-  
-      // Check for supported memory types - be lenient here, we'll try to work with what we have
-      if (surface->memType != NVBUF_MEM_SURFACE_ARRAY && 
-          surface->memType != NVBUF_MEM_CUDA) {
-          GST_WARNING_OBJECT(filter, "Unsupported memory type: %d (expecting NVBUF_MEM_SURFACE_ARRAY=4 or NVBUF_MEM_CUDA=2)", 
-                            surface->memType);
-          // Continue anyway, as we'll try to work with it
-      }
-  
-      // Set the CUDA device
-      cudaError_t cudaErr = cudaSetDevice(surface->gpuId);
-      if (cudaErr != cudaSuccess) {
-          GST_ERROR_OBJECT(filter, "CUDA error after setting device: %s", cudaGetErrorString(cudaErr));
-          gst_buffer_unmap(buf, &in_map_info);
-          return GST_FLOW_ERROR;
-      }
-  
-      // Map the NvBufSurface for CUDA processing
-      int mapStatus = NvBufSurfaceMap(surface, -1, -1, NVBUF_MAP_READ_WRITE);
-      if (mapStatus != 0) {
-          GST_ERROR_OBJECT(filter, "Failed to map NvBufSurface: %d", mapStatus);
-          gst_buffer_unmap(buf, &in_map_info);
-          return GST_FLOW_ERROR;
-      }
-  
-      // Sync the surface for GPU access
-      int syncStatus = NvBufSurfaceSyncForDevice(surface, -1, -1);
-      if (syncStatus != 0) {
-          GST_ERROR_OBJECT(filter, "Failed to sync surface for device: %d", syncStatus);
-          NvBufSurfaceUnMap(surface, -1, -1);
-          gst_buffer_unmap(buf, &in_map_info);
-          return GST_FLOW_ERROR;
-      }
-  
-      // Get the surface parameters for the first frame
-      if (surface->numFilled < 1) {
-          GST_ERROR_OBJECT(filter, "No filled surfaces available");
-          NvBufSurfaceUnMap(surface, -1, -1);
-          gst_buffer_unmap(buf, &in_map_info);
-          return GST_FLOW_ERROR;
-      }
-      printf("filled:%d\n",surface->numFilled);
-  
-      NvBufSurfaceParams* surfaceParams = &(surface->surfaceList[0]);
-  
-      // Validate the surface parameters
-      if (surfaceParams->width <= 0 || surfaceParams->height <= 0 || surfaceParams->pitch <= 0) {
-          GST_ERROR_OBJECT(filter, "Invalid surface parameters: width=%d, height=%d, pitch=%d",
-                            surfaceParams->width, surfaceParams->height, surfaceParams->pitch);
-          NvBufSurfaceUnMap(surface, -1, -1);
-          gst_buffer_unmap(buf, &in_map_info);
-          return GST_FLOW_ERROR;
-      }
-  
-      // Validate the mapped address
-      if (!surfaceParams->mappedAddr.addr[0]) {
-          GST_ERROR_OBJECT(filter, "NULL mapped address for Y plane");
-          NvBufSurfaceUnMap(surface, -1, -1);
-          gst_buffer_unmap(buf, &in_map_info);
-          return GST_FLOW_ERROR;
-      }
-  
-      // Additional diagnostic info
-      GST_DEBUG_OBJECT(filter, "Surface Color Format: %d", surfaceParams->colorFormat);
-      GST_DEBUG_OBJECT(filter, "Surface Layout: %d", surfaceParams->layout);
-      GST_DEBUG_OBJECT(filter, "Surface planePitch: %d,%d,%d", 
-                      surfaceParams->planeParams.pitch[0],
-                      surfaceParams->planeParams.pitch[1],
-                      surfaceParams->planeParams.pitch[2]);
-  
-      // Skip the cudaPointerGetAttributes check as it varies between CUDA versions
-      GST_DEBUG_OBJECT(filter, "CUDA pointer at %p", surfaceParams->mappedAddr.addr[0]);
-  
-      GST_DEBUG_OBJECT(filter, "Frame info: width=%d, height=%d, pitch=%d, ptr=%p",
-          surfaceParams->width, surfaceParams->height, surfaceParams->planeParams.pitch[0], surfaceParams->mappedAddr.addr[0]);
-  
-      // Process the frame with CUDA
-      if (!cuda_process_frame(surface->gpuId, surfaceParams->mappedAddr.addr[0], surfaceParams->width, surfaceParams->height, surfaceParams->planeParams.pitch[0])) {
-          GST_ERROR_OBJECT(filter, "Failed to process frame with CUDA");
-          ret = GST_FLOW_ERROR;
-      } else {
-          GST_DEBUG_OBJECT(filter, "CUDA processing successful");
-  
-          // Sync back to CPU
-          syncStatus = NvBufSurfaceSyncForCpu(surface, -1, -1);
-          if (syncStatus != 0) {
-              GST_WARNING_OBJECT(filter, "Failed to sync surface back to CPU: %d", syncStatus);
-              // Not treating this as a fatal error
-          }
-      }
-  
-      // Unmap the surface
-      NvBufSurfaceUnMap(surface, -1, -1);
 
+void handleSurface(GstCudaSample *filter, NvBufSurface *surface)
+{
+    NvBufSurfaceParams* src_params = &surface->surfaceList[0];
+    if (!filter->temp_surface_initialized) 
+    {
+
+        NvBufSurfaceCreateParams create_params = {0};
+        create_params.gpuId = filter->gpu_id;
+        create_params.width = src_params->width;
+        create_params.height = src_params->height;
+        create_params.colorFormat = NVBUF_COLOR_FORMAT_NV12;
+        create_params.layout = NVBUF_LAYOUT_PITCH;
+        create_params.memType = NVBUF_MEM_DEFAULT; // CPU accessible
+
+        if (NvBufSurfaceCreate(&filter->temp_surface, 1, &create_params) != 0) 
+        {
+            GST_ERROR("Failed to create temp surface");
+            return;
+        }
+        cudaMallocManaged(&filter->unified_sharpness_buffer, src_params->width*src_params->height, cudaMemAttachGlobal);
+        printf("\n\n\nunified dharpness buffer %p\n", filter->unified_sharpness_buffer);
+        filter->temp_surface_initialized = true;
     }
- 
-     // Unmap the buffer
-     gst_buffer_unmap(buf, &in_map_info);
- 
-     return ret;
- }
+
+
+    // Map NVMM buffer to CPU
+    // Corrected buffer mappings
+    if (NvBufSurfaceMap(surface, -1, -1, NVBUF_MAP_READ_WRITE) != 0 || NvBufSurfaceMap(filter->temp_surface, -1, -1, NVBUF_MAP_READ_WRITE) != 0) 
+    {
+        GST_ERROR("Surface mapping failed");
+        return;
+    }
+
+    NvBufSurfaceSyncForCpu(surface, -1, -1);
+    NvBufSurfaceSyncForCpu(filter->temp_surface, -1, -1);
+
+
+    // Copy NVMM->CPU buffer
+    cudaMemcpy2DAsync(
+        filter->temp_surface->surfaceList[0].mappedAddr.addr[0],
+        filter->temp_surface->surfaceList[0].planeParams.pitch[0],
+        surface->surfaceList[0].mappedAddr.addr[0],
+        surface->surfaceList[0].planeParams.pitch[0],
+        src_params->width,
+        src_params->height,
+        cudaMemcpyHostToHost,
+        filter->cuda_stream
+    );
+
+    // Ensure copy is done
+    cudaStreamSynchronize(0);
+
+    // Now run your CUDA kernel (temp_surface must be mapped with cudaHostRegister for CUDA kernel directly)
+    cudaHostRegister(filter->temp_surface->surfaceList[0].mappedAddr.addr[0],
+                        src_params->height * filter->temp_surface->surfaceList[0].planeParams.pitch[0],
+                        cudaHostRegisterMapped);
+
+    unsigned char* y_plane_dev;
+    cudaHostGetDevicePointer(&y_plane_dev, filter->temp_surface->surfaceList[0].mappedAddr.addr[0], 0);
+
+    cuda_process_frame(y_plane_dev,
+        src_params->width,
+        src_params->height,
+        filter->temp_surface->surfaceList[0].planeParams.pitch[0]);
+
+    cudaStreamSynchronize(0);
+    cudaHostUnregister(filter->temp_surface->surfaceList[0].mappedAddr.addr[0]);
+
+
+    // Copy CPU buffer back to NVMM buffer
+    cudaMemcpy2DAsync(
+        surface->surfaceList[0].mappedAddr.addr[0],
+        surface->surfaceList[0].planeParams.pitch[0],
+        filter->temp_surface->surfaceList[0].mappedAddr.addr[0],
+        filter->temp_surface->surfaceList[0].planeParams.pitch[0],
+        src_params->width,
+        src_params->height,
+        cudaMemcpyHostToHost,
+        NULL
+    );
+
+    cudaStreamSynchronize(0);
+
+    NvBufSurfaceSyncForDevice(surface, -1, -1);
+    NvBufSurfaceUnMap(filter->temp_surface, -1, -1);
+    
+}
+
+
+
+ static GstFlowReturn gst_cuda_sample_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
+ {
+    GstCudaSample *filter = GST_cuda_sample (trans);
+    GstFlowReturn ret = GST_FLOW_OK;
+    GstMapInfo in_map_info;
+    NvBufSurface *surface = NULL;
+
+    filter->frame_num++;
+
+    GST_DEBUG_OBJECT(filter, "Processing Frame %lu", filter->frame_num);
+
+    /* Skip processing if not enabled */
+    if (!filter->process_enabled) {
+        GST_DEBUG_OBJECT(filter, "Processing disabled, skipping frame");
+        return GST_FLOW_OK;
+    }
+
+    // Validate buffer
+    if (!buf || gst_buffer_get_size(buf) == 0) {
+        GST_WARNING_OBJECT(filter, "Empty buffer received, skipping");
+        return GST_FLOW_OK;
+    }
+
+    // Map the buffer for read/write access
+    memset(&in_map_info, 0, sizeof(in_map_info));
+    if (!gst_buffer_map(buf, &in_map_info, GST_MAP_READ | GST_MAP_WRITE)) {
+        GST_ERROR_OBJECT(filter, "Failed to map gst buffer");
+        return GST_FLOW_ERROR;
+    }
+
+    // Get the NvBufSurface from the mapped buffer
+    surface = (NvBufSurface *)in_map_info.data;
+    if (!surface) {
+        GST_ERROR_OBJECT(filter, "Failed to get NvBufSurface from mapped buffer");
+        gst_buffer_unmap(buf, &in_map_info);
+        return GST_FLOW_ERROR;
+    }
+
+    handleSurface(filter, surface);
+
+    // Unmap the surface
+    NvBufSurfaceUnMap(surface, -1, -1);
+
+    // Unmap the buffer
+    gst_buffer_unmap(buf, &in_map_info);
+
+    return ret;
+}
  
  /* Plugin initialization function */
  static gboolean
